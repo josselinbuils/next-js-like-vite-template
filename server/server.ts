@@ -14,10 +14,12 @@ const PORT = 3000;
 
   app.use(await getServerMiddleware());
 
+  // Errors 404
   app.all("*", (_, res) => {
     res.sendStatus(HTTP_NOT_FOUND);
   });
 
+  // Errors 500
   app.use(
     // next is required even if not used
     (_error: Error, _req: Request, res: Response, _next: NextFunction) => {

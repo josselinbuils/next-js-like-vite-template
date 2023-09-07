@@ -8,21 +8,37 @@ import {
 } from "vite";
 import express from "express";
 
-const VIRTUAL_DOCUMENT_ID = "virtual:page:document";
+// Client side hydration module.
 const VIRTUAL_ENTRY_CLIENT_PREFIX = "/virtual:page:entry-client:";
-const VIRTUAL_ENTRY_PAGE_PREFIX = "virtual:page:entry-page:";
+
+// Server side rendering module.
 const VIRTUAL_ENTRY_SERVER_PREFIX = "virtual:page:entry-server:";
 
 const pagesDirPath = path.join(process.cwd(), "src/pages");
 const documentPath = path.join(pagesDirPath, "_document.tsx");
 
+/**
+ * Vite is nice, but it forces us to have 1 HTML entrypoint by page, so we
+ * cannot factorise them.
+ *
+ * This plugin allows to generate pages HTML dynamically based on Next.js pages
+ * folder logic:
+ * - A _document.tsx file to generate the common HTML.
+ * - A React component as entrypoint by page.
+ *
+ * It also implements the file routing logic.
+ */
 export function vitePluginPage(): Plugin {
   let viteDevServerPromise: Promise<ViteDevServer> | undefined;
-  let pageNames: string[];
+  let pageNames: string[]; // ex: ['index', 'blog/[articleId]']
 
   return {
     name: "vite-plugin-page",
     enforce: "pre",
+
+    /**
+     *  Adds page entrypoints to Rollup config.
+     */
     async config(userConfig) {
       if (userConfig.build?.rollupOptions?.input !== undefined) {
         throw new Error(
@@ -42,7 +58,12 @@ export function vitePluginPage(): Plugin {
         },
       };
     },
+
+    /**
+     *  Makes Vite dev server compatible with pages folder.
+     */
     async configureServer(server) {
+      // Add a Vite dev server middleware to render pages
       server.middlewares.use(async (req, res, next) => {
         const { url } = req;
 
@@ -51,11 +72,15 @@ export function vitePluginPage(): Plugin {
           return;
         }
 
-        const matchingPageName = pageNames.find((pageName) =>
-          new RegExp(
-            `^/${pageName.replace(/index$/, "").replace(/:[^/]+/, "[^/]+")}$`,
-          ).test(url),
-        );
+        const matchingPageName = pageNames.find((pageName) => {
+          return new RegExp(
+            `^/${
+              pageName
+                .replace(/index$/, "") // Aliases /index to /.
+                .replace(/\[[^/]+]/, "[^/]+") // Matches any character for `[param]` dynamic parameters.
+            }$`,
+          ).test(url);
+        });
 
         if (matchingPageName) {
           const { render } = (await server.ssrLoadModule(
@@ -73,14 +98,11 @@ export function vitePluginPage(): Plugin {
         }
       });
     },
+
+    /**
+     * Tells Rollup what imports will be managed by the plugin.
+     */
     resolveId(source) {
-      if (source === VIRTUAL_DOCUMENT_ID) {
-        return documentPath;
-      }
-      if (source.startsWith(VIRTUAL_ENTRY_PAGE_PREFIX)) {
-        const pageName = source.replace(VIRTUAL_ENTRY_PAGE_PREFIX, "");
-        return path.join(pagesDirPath, `${pageName}.tsx`);
-      }
       if (
         source.startsWith(VIRTUAL_ENTRY_CLIENT_PREFIX) ||
         source.startsWith(VIRTUAL_ENTRY_SERVER_PREFIX) ||
@@ -89,35 +111,12 @@ export function vitePluginPage(): Plugin {
         return source;
       }
     },
+
+    /**
+     * Generates the code for virtual modules.
+     */
     async load(id) {
-      if (id.startsWith(VIRTUAL_ENTRY_CLIENT_PREFIX)) {
-        const pageName = id.replace(VIRTUAL_ENTRY_CLIENT_PREFIX, "");
-        return `\
-import { createElement, hydrate } from 'preact/compat';
-import Page from '${VIRTUAL_ENTRY_PAGE_PREFIX}${pageName}';
-
-hydrate(createElement(Page, null), document.getElementById('app'));
-`;
-      }
-      if (id.startsWith(VIRTUAL_ENTRY_SERVER_PREFIX)) {
-        const pageName = id.replace(VIRTUAL_ENTRY_SERVER_PREFIX, "");
-        return `\
-import { createElement } from 'preact/compat';
-import { renderToString } from 'preact-render-to-string';
-import Document from '${VIRTUAL_DOCUMENT_ID}';
-import Page from '${VIRTUAL_ENTRY_PAGE_PREFIX}${pageName}';
-
-export function render() {
-  return renderToString(
-   createElement(
-     Document,
-     { entryScriptUrl: '${VIRTUAL_ENTRY_CLIENT_PREFIX}${pageName}' },
-     createElement(Page, null)
-   )
-  );
-}
-`;
-      }
+      // Generate HTML of page Rollup entrypoints.
       if (id.endsWith(".html")) {
         const pageName = id.replace(/\.html$/, "");
 
@@ -133,7 +132,40 @@ export function render() {
         );
         return withDocType(render());
       }
+
+      // Server side rendering module.
+      if (id.startsWith(VIRTUAL_ENTRY_SERVER_PREFIX)) {
+        const pageName = id.replace(VIRTUAL_ENTRY_SERVER_PREFIX, "");
+        return `\
+import { createElement } from 'preact/compat';
+import { renderToString } from 'preact-render-to-string';
+import Document from '${documentPath}';
+import Page from '${path.join(pagesDirPath, `${pageName}.tsx`)}';
+
+export function render() {
+  return renderToString(
+   createElement(
+     Document,
+     { entryScriptUrl: '${VIRTUAL_ENTRY_CLIENT_PREFIX}${pageName}' },
+     createElement(Page, null)
+   )
+  );
+}
+`;
+      }
+
+      // Client side hydration module.
+      if (id.startsWith(VIRTUAL_ENTRY_CLIENT_PREFIX)) {
+        const pageName = id.replace(VIRTUAL_ENTRY_CLIENT_PREFIX, "");
+        return `\
+import { createElement, hydrate } from 'preact/compat';
+import Page from '${path.join(pagesDirPath, `${pageName}.tsx`)}';
+
+hydrate(createElement(Page, null), document.getElementById('app'));
+`;
+      }
     },
+
     async buildEnd() {
       if (viteDevServerPromise) {
         await (await viteDevServerPromise).close();
@@ -142,6 +174,9 @@ export function render() {
   };
 }
 
+/**
+ * Provides Express middleware to handle page URLs in production.
+ */
 export async function getServerMiddleware() {
   const router = express.Router();
   const viteConfig = await resolveConfig({}, "build");
@@ -151,7 +186,12 @@ export async function getServerMiddleware() {
   const pagePaths = await glob("**/*.html", { cwd: distPath });
 
   for (const pagePath of pagePaths) {
-    const route = `/${pagePath.replace(/\.html$/, "").replace(/index$/, "")}`;
+    const route = `/${
+      pagePath
+        .replace(/\[([^\]]+)]/, ":$1") // Replaces `[param]` dynamic parameters by `:param` Express version.
+        .replace(/\.html$/, "") // Removes extension.
+        .replace(/index$/, "") // Aliases /index to /.
+    }`;
 
     router.get(route, (_, res) => {
       res.sendFile(path.join(distPath, pagePath));
