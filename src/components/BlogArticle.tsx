@@ -1,7 +1,7 @@
 import { type FunctionComponent } from "preact/compat";
 
 export interface BlogArticleProps {
-  articleId: number;
+  articleId?: number;
 }
 
 export const BlogArticle: FunctionComponent<BlogArticleProps> = ({
